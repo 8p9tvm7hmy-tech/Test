@@ -24,13 +24,30 @@ class Params:
     fee_round_trip: float = 1.25        # ٪ کارمزد خرید + فروش + مالیات
     capital: float = 1e9                # ریال
     risk_per_trade: float = 1.0         # ٪ از سرمایه در هر معامله
+    target_r: float = 1.5               # هدف ۱ = چند برابر ریسک (تنظیم خودکار ممکن است تغییرش دهد)
+    max_hold: int = 10                  # مهلت نگهداری پیشنهادی (روز معاملاتی)
+
+
+def session_date(now: pd.Timestamp | None = None) -> pd.Timestamp:
+    """Date of the trading session the market watch currently shows.
+
+    Tehran trades Saturday–Wednesday from 09:00; before the open, and on Thursday
+    and Friday, the market watch still shows the previous session.
+    """
+    now = now if now is not None else pd.Timestamp.now(tz=TEHRAN_TZ).tz_localize(None)
+    day = now.normalize()
+    if now.hour < 9:
+        day -= pd.Timedelta(days=1)
+    while day.weekday() in (3, 4):  # Thursday, Friday
+        day -= pd.Timedelta(days=1)
+    return day
 
 
 def merge_today(hist: pd.DataFrame, row: pd.Series) -> pd.DataFrame:
-    """Append today's market-watch row when the daily history doesn't have it yet."""
+    """Append the current session's market-watch row when the daily history doesn't have it yet."""
     if hist.empty or not (row.get("volume", 0) > 0):
         return hist
-    today = pd.Timestamp.now(tz=TEHRAN_TZ).tz_localize(None).normalize()
+    today = session_date()
     if hist.index[-1] >= today:
         return hist
     new = pd.DataFrame([{
@@ -39,6 +56,39 @@ def merge_today(hist: pd.DataFrame, row: pd.Series) -> pd.DataFrame:
         "volume": row["volume"], "value": row["value"], "count": row["count"],
     }], index=[today])
     return pd.concat([hist, new])
+
+
+# -------------------------------------------------------------- memory
+FLOW_COLS = ["buy_count_i", "sell_count_i", "buy_vol_i", "sell_vol_i"]
+
+
+def _streak(mask: pd.Series) -> pd.Series:
+    """Length of the run of True values ending on each day."""
+    mask = mask.fillna(False).astype(bool)
+    return mask.groupby((~mask).cumsum()).cumsum()
+
+
+def add_flow_features(h: pd.DataFrame, flow: pd.DataFrame | None) -> pd.DataFrame:
+    """Join the stored daily individual money flow and derive memory features.
+
+    bp: buyer power (per-capita individual buy ÷ sell), net_ind: individual net inflow (ریال),
+    in_streak/out_streak: consecutive days of inflow/outflow, net5/bp5: 5-day sum/mean,
+    flow_days: how many days of flow memory exist up to each day.
+    """
+    if flow is None or flow.empty:
+        return h
+    out = h.copy()
+    f = flow.reindex(out.index)[FLOW_COLS]
+    buy_pc = f["buy_vol_i"] / f["buy_count_i"].replace(0, np.nan)
+    sell_pc = f["sell_vol_i"] / f["sell_count_i"].replace(0, np.nan)
+    out["bp"] = buy_pc / sell_pc
+    out["net_ind"] = (f["buy_vol_i"] - f["sell_vol_i"]) * out["close"]
+    out["in_streak"] = _streak(out["net_ind"] > 0)
+    out["out_streak"] = _streak(out["net_ind"] < 0)
+    out["net5"] = out["net_ind"].rolling(5, min_periods=5).sum()
+    out["bp5"] = out["bp"].rolling(5, min_periods=5).mean()
+    out["flow_days"] = out["net_ind"].notna().cumsum()
+    return out
 
 
 def _signal(score: float) -> str:
@@ -108,8 +158,9 @@ def swing_analysis(df: pd.DataFrame, row: pd.Series, p: Params) -> dict | None:
     elif t.close < t.bb_low and r >= 30:
         add(-3, "زیر باند پایین بولینگر")
 
-    # Money flow (today, from market watch)
-    bp = row.get("buyer_power", np.nan)
+    # Money flow: from memory when available, otherwise today's market watch
+    has_memory = "bp" in df.columns and not np.isnan(t.get("bp", np.nan))
+    bp = t["bp"] if has_memory else row.get("buyer_power", np.nan)
     if not np.isnan(bp):
         if bp >= 1.5:
             add(8, f"قدرت خریدار حقیقی بالا ({bp:.2f})")
@@ -117,9 +168,19 @@ def swing_analysis(df: pd.DataFrame, row: pd.Series, p: Params) -> dict | None:
             add(4, f"قدرت خریدار حقیقی مثبت ({bp:.2f})")
         elif bp < 0.8:
             add(-6, f"قدرت فروشنده غالب ({bp:.2f})")
-    ni = row.get("net_individual", np.nan)
+    ni = t["net_ind"] if has_memory else row.get("net_individual", np.nan)
     if not np.isnan(ni) and ni != 0:
         add(3, "ورود پول حقیقی") if ni > 0 else add(-3, "خروج پول حقیقی")
+    in_streak = out_streak = 0
+    net5 = np.nan
+    if has_memory and t["flow_days"] >= 5:
+        in_streak, out_streak, net5 = int(t["in_streak"]), int(t["out_streak"]), t["net5"]
+        if in_streak >= 3:
+            add(4, f"ورود پول حقیقی {in_streak} روز متوالی (حافظه)")
+        if out_streak >= 3:
+            add(-4, f"خروج پول حقیقی {out_streak} روز متوالی (حافظه)")
+        if net5 > 0 and t["bp5"] >= 1.2:
+            add(3, f"ورود پول و قدرت خریدار در ۵ روز اخیر ({t['bp5']:.2f})")
     if row.get("sell_queue"):
         add(-10, "صف فروش")
     if row.get("buy_queue"):
@@ -135,7 +196,7 @@ def swing_analysis(df: pd.DataFrame, row: pd.Series, p: Params) -> dict | None:
     if stop >= close:
         stop = close - 1.5 * atr
     risk = close - stop
-    t1, t2 = close + 1.5 * risk, close + 3 * risk
+    t1, t2 = close + p.target_r * risk, close + 2 * p.target_r * risk
     shares = int(min(p.capital * p.risk_per_trade / 100 / risk, p.capital / close)) if risk > 0 else 0
     return {
         "score": round(score, 1), "signal": _signal(score), "reasons": why,
@@ -146,6 +207,7 @@ def swing_analysis(df: pd.DataFrame, row: pd.Series, p: Params) -> dict | None:
         "t1_net_pct": (t1 / close - 1) * 100 - p.fee_round_trip,
         "shares": shares, "position_value": shares * close,
         "avg_value20": avg_value, "resistance60": float(df["high"].iloc[-60:].max()),
+        "max_hold": p.max_hold, "in_streak": in_streak, "out_streak": out_streak, "net5": net5,
     }
 
 
@@ -216,15 +278,19 @@ def long_term_reasons(r: pd.Series, p: Params) -> list[str]:
 
 
 # ----------------------------------------------------------------- scan
-def scan(market: pd.DataFrame, histories: dict, p: Params):
-    """Run both analyses on every symbol that has a history."""
+def scan(market: pd.DataFrame, histories: dict, p: Params, flows: dict | None = None):
+    """Run both analyses on every symbol that has a history.
+
+    flows: ins_code -> stored daily individual money flow (memory), optional.
+    """
+    flows = flows or {}
     swings, metrics, frames = [], {}, {}
     rows = market.set_index("ins_code")
     for code, hist in histories.items():
         if code not in rows.index or hist.empty:
             continue
         row = rows.loc[code]
-        h = ind.add_all(merge_today(hist, row))
+        h = add_flow_features(ind.add_all(merge_today(hist, row)), flows.get(code))
         frames[code] = h
         metrics[code] = history_metrics(h)
         s = swing_analysis(h, row, p)

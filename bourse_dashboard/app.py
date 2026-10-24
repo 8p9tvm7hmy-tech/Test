@@ -18,6 +18,8 @@ import config
 import data
 import demo
 import indicators as ind
+import memory
+import tuner
 
 st.set_page_config(page_title="داشبورد بورس تهران", page_icon="📈", layout="wide")
 
@@ -65,19 +67,34 @@ with st.sidebar:
     refresh = st.button("🔄 دریافت دوباره داده‌ها", width="stretch")
     st.caption("سابقه قیمت‌ها ۶ ساعت ذخیره می‌شود؛ اجرای اول برای همه نمادها چند دقیقه طول می‌کشد.")
 
+is_demo = source.startswith("داده نمونه")
+
+
+def active_tuning():
+    """Latest tuning result: from memory for live data, from this session for demo data."""
+    return st.session_state.get("demo_tuning") if is_demo else tuner.latest()
+
+
+tuning = active_tuning()
+tp = tuning["params"] if (tuning and cfg["use_tuned"]) else dict(tuner.DEFAULT)
 params = an.Params(min_avg_value=min_value_b * BILLION, risk_free=rf, fee_round_trip=fee,
-                   capital=capital_m * 1e6 * 10, risk_per_trade=risk_pct)
+                   capital=capital_m * 1e6 * 10, risk_per_trade=risk_pct,
+                   target_r=tp["target_r"], max_hold=tp["max_hold"])
 
 
 # --------------------------------------------------------------------- data
 def load(source: str, max_symbols: int):
     if source.startswith("داده نمونه"):
-        return (*demo.demo_market(), "نمونه")
+        market, histories = demo.demo_market()
+        return market, histories, demo.demo_flows(histories), "نمونه"
     bar = st.progress(0.0, text="دریافت سابقه قیمت نمادها…")
     market, histories = data.load_market_and_histories(
         max_symbols, progress=lambda d, t: bar.progress(d / t, text=f"دریافت سابقه قیمت: {d} از {t}"))
+    bar.progress(0.0, text="به‌روزرسانی حافظه پول حقیقی…")
+    flows = memory.refresh(market, list(histories), progress=lambda d, t: bar.progress(
+        d / t, text=f"ساخت حافظه پول حقیقی (فقط بار اول): {d} از {t}"))
     bar.empty()
-    return market, histories, "TSETMC"
+    return market, histories, flows, "TSETMC"
 
 
 key = (source, int(max_symbols))
@@ -93,8 +110,18 @@ if refresh or st.session_state.get("key") != key:
                 "برای دیدن داشبورد «داده نمونه» را انتخاب کنید.")
         st.stop()
 
-market, histories, origin = st.session_state["raw"]
-swing, longterm, frames = an.scan(market, histories, params)
+market, histories, flows, origin = st.session_state["raw"]
+swing, longterm, frames = an.scan(market, histories, params, flows)
+
+if origin == "TSETMC":
+    memory.save_scores(swing, longterm)
+# Weekly re-tuning (demo data is tuned once per session and never stored).
+if (is_demo and tuning is None) or (not is_demo and tuner.is_stale()):
+    with st.spinner("تنظیم خودکار هفتگی استراتژی با بک‌تست…"):
+        res = tuner.tune(frames, fee=fee, min_avg_value=params.min_avg_value, store=not is_demo)
+        if is_demo:
+            st.session_state["demo_tuning"] = res
+    st.rerun()
 
 st.title("📈 داشبورد تحلیل بورس تهران")
 st.caption(f"منبع: {origin} · آخرین دریافت: {st.session_state['loaded_at']} · "
@@ -134,7 +161,8 @@ def codal_sales(symbol):
 
 
 tabs = st.tabs(["📊 نمای بازار", "⚡ نوسان‌گیری (کوتاه‌مدت)", "🏦 سرمایه‌گذاری (بلندمدت)",
-                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "🧪 بک‌تست", "🔔 هشدار تلگرام", "ℹ️ راهنما"])
+                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "🧪 بک‌تست", "🧠 حافظه و تنظیم خودکار",
+                "🔔 هشدار تلگرام", "ℹ️ راهنما"])
 
 # ---------------------------------------------------------------- overview
 with tabs[0]:
@@ -183,13 +211,21 @@ with tabs[0]:
 # ------------------------------------------------------------------- swing
 with tabs[1]:
     st.subheader("⚡ فرصت‌های نوسان‌گیری")
-    st.caption("ترکیب روند (EMA)، مومنتوم (RSI، MACD)، حجم، شکست مقاومت و جریان پول حقیقی امروز. "
-               "حد ضرر بر اساس ATR و کف ۱۰ روزه، هدف‌ها ۱.۵ و ۳ برابر ریسک.")
+    st.caption("ترکیب روند (EMA)، مومنتوم (RSI، MACD)، حجم، شکست مقاومت، جریان پول حقیقی امروز و "
+               "حافظه پول حقیقی روزهای اخیر. حد ضرر بر اساس ATR و کف ۱۰ روزه.")
+    st.markdown(f"پارامترهای فعال: حداقل امتیاز **{tp['min_score']}** · هدف ۱ = **{tp['target_r']:g}** برابر ریسک · "
+                f"مهلت نگهداری **{tp['max_hold']}** روز "
+                + ("(از تنظیم خودکار)" if tuning and tuning.get("adopted") and cfg["use_tuned"] else "(پیش‌فرض)"))
     if swing.empty:
         st.warning("هیچ نمادی سابقه کافی (۶۰ روز) نداشت.")
     else:
         f1, f2, f3, f4 = st.columns([1, 2, 2, 1])
-        min_score = f1.slider("حداقل امتیاز", 0, 100, 65)
+        recent = (tuning or {}).get("best" if (tuning or {}).get("adopted") else "default") or {}
+        if recent.get("test_avg") is not None and recent["test_avg"] <= 0 and recent.get("test_trades", 0) >= 15:
+            st.warning(f"⚠️ در {recent['test_trades']} سیگنال هفته‌های اخیر (از {tuning['split']}) میانگین سود خالص "
+                       f"{recent['test_avg']:.2f}٪ بوده است؛ شرایط فعلی بازار برای نوسان‌گیری مساعد نبوده. "
+                       "حجم معاملات را کم کنید یا صبر کنید.")
+        min_score = f1.slider("حداقل امتیاز", 0, 100, int(tp["min_score"]))
         sigs = f2.multiselect("سیگنال", list(SIGNAL_COLORS), default=["خرید قوی", "خرید"])
         secs = f3.multiselect("گروه صنعت", sorted(swing["sector"].unique()))
         no_queue = f4.checkbox("حذف صف خرید", True)
@@ -206,7 +242,9 @@ with tabs[1]:
                 "close": "قیمت", "change_pct": "تغییر امروز٪", "rsi": "RSI", "vol_ratio": "نسبت حجم",
                 "buyer_power": "قدرت خریدار", "atr_pct": "نوسان روزانه٪", "stop": "حد ضرر",
                 "target1": "هدف ۱", "target2": "هدف ۲", "t1_net_pct": "سود خالص هدف۱٪",
-                "shares": "تعداد سهم پیشنهادی"}
+                "shares": "تعداد سهم پیشنهادی", "in_streak": "روزهای متوالی ورود پول",
+                "net5_b": "پول حقیقی ۵ روزه (میلیارد تومان)"}
+        v = v.assign(net5_b=v["net5"] / 1e10)
         num = st.column_config.NumberColumn
         st.dataframe(v[list(cols)].rename(columns=cols), hide_index=True, width="stretch",
                      height=520, column_config={
@@ -216,6 +254,7 @@ with tabs[1]:
                          "RSI": num(format="%.0f"),
                          **{k: num(format="localized") for k in ("قیمت", "حد ضرر", "هدف ۱", "هدف ۲",
                                                                   "تعداد سهم پیشنهادی")},
+                         "پول حقیقی ۵ روزه (میلیارد تومان)": num(format="%.1f"),
                      })
         dist = swing["signal"].value_counts().reindex(list(SIGNAL_COLORS)).fillna(0)
         fig = go.Figure(go.Bar(x=dist.index, y=dist.values, marker_color=list(SIGNAL_COLORS.values())))
@@ -355,8 +394,38 @@ with tabs[3]:
                                  name="سیگنال"), 4, 1)
         fig.update_layout(height=820, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
                           legend=dict(orientation="h", y=1.02), hovermode="x unified")
-        fig.update_xaxes(rangebreaks=[dict(bounds=["thu", "sat"])] if origin == "TSETMC" else [])
+        fig.update_xaxes(rangebreaks=[dict(bounds=["thu", "sat"])])
         st.plotly_chart(fig, width="stretch")
+
+        st.subheader("🧠 حافظه نماد")
+        hm = frames[code]
+        m1, m2 = st.columns(2)
+        if "net_ind" in hm.columns and hm["net_ind"].notna().any():
+            fl = hm.iloc[-60:]
+            figf = make_subplots(specs=[[{"secondary_y": True}]])
+            figf.add_trace(go.Bar(x=fl.index, y=fl["net_ind"] / 1e10, name="ورود/خروج پول حقیقی",
+                                  marker_color=np.where(fl["net_ind"] >= 0, "#16a34a", "#dc2626")))
+            figf.add_trace(go.Scatter(x=fl.index, y=fl["bp"], name="قدرت خریدار",
+                                      line=dict(color="#3b82f6")), secondary_y=True)
+            figf.update_layout(title="پول حقیقی ۶۰ روز اخیر (میلیارد تومان) و قدرت خریدار", height=320,
+                               margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15))
+            figf.update_xaxes(rangebreaks=[dict(bounds=["thu", "sat"])])
+            m1.plotly_chart(figf, width="stretch")
+        else:
+            m1.info("هنوز حافظه پول حقیقی برای این نماد ساخته نشده است.")
+        sc_hist = bt.score_series(hm, params.min_avg_value).iloc[-120:]
+        figs = go.Figure(go.Scatter(x=sc_hist.index, y=sc_hist, name="امتیاز نوسان‌گیری", line=dict(color="#f59e0b")))
+        if origin == "TSETMC":
+            stored = memory.load_scores(code)
+            if not stored.empty and stored["lt_score"].notna().any():
+                figs.add_trace(go.Scatter(x=stored.index, y=stored["lt_score"], name="امتیاز بلندمدت (ذخیره‌شده)",
+                                          mode="lines+markers", line=dict(color="#8b5cf6")))
+        figs.add_hline(y=tp["min_score"], line=dict(color="gray", dash="dot"),
+                       annotation_text="آستانه سیگنال", annotation_position="top left")
+        figs.update_layout(title="سابقه امتیاز ۱۲۰ روز اخیر", height=320, yaxis_range=[0, 100],
+                           margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15))
+        figs.update_xaxes(rangebreaks=[dict(bounds=["thu", "sat"])])
+        m2.plotly_chart(figs, width="stretch")
 
         st.subheader("📄 کدال")
         sym = mk.loc[code, "symbol"]
@@ -437,18 +506,22 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("🧪 بک‌تست استراتژی نوسان‌گیری")
     st.caption("اگر در گذشته به هر سیگنال نوسان‌گیری عمل می‌کردیم چه می‌شد؟ ورود: قیمت باز شدن روز بعد از سیگنال؛ "
-               "خروج: حد ضرر، هدف یا پایان مهلت؛ کارمزد از هر معامله کم می‌شود. جریان پول حقیقی روزهای گذشته "
-               "در دسترس نیست، پس فقط بخش تکنیکال امتیاز آزموده می‌شود.")
+               "خروج: حد ضرر، هدف یا پایان مهلت؛ کارمزد از هر معامله کم می‌شود. امتیاز روزهای گذشته با همان "
+               "قواعد داشبورد، شامل پول حقیقی و حافظه (هر جا داده‌اش در حافظه باشد)، حساب می‌شود.")
+    cov = np.mean([f["net_ind"].notna().mean() if "net_ind" in f else 0 for f in frames.values()]) if frames else 0
+    st.caption(f"پوشش حافظه پول حقیقی در داده‌های قیمت: {cov * 100:.0f}٪ روزها")
     if origin == "نمونه":
         st.warning("روی داده ساختگی (تصادفی) نتیجه باید نزدیک صفر باشد؛ نتیجه واقعی را با داده TSETMC ببینید.")
     f = st.columns(5)
-    bt_score = f[0].slider("حداقل امتیاز سیگنال", 50, 95, 65, step=5)
-    bt_hold = f[1].number_input("حداکثر روز نگهداری", 1, 60, 10)
-    bt_target = f[2].selectbox("هدف خروج", ["هدف ۱ (۱.۵ برابر ریسک)", "هدف ۲ (۳ برابر ریسک)"])
+    bt_score = f[0].slider("حداقل امتیاز سیگنال", 50, 95, int(tp["min_score"]), step=5)
+    bt_hold = f[1].number_input("حداکثر روز نگهداری", 1, 60, int(tp["max_hold"]))
+    targets = [1.0, 1.5, 2.0, 3.0]
+    bt_target_r = f[2].selectbox("هدف خروج (چند برابر ریسک)", targets,
+                                 index=targets.index(tp["target_r"]) if tp["target_r"] in targets else 1)
     bt_days = f[3].number_input("بازه آزمون (روز معاملاتی اخیر)", 60, 2000, 250, step=50)
     bt_pos = f[4].slider("سهم هر معامله از سرمایه (٪)", 5, 100, 20, step=5)
     bt_params = bt.BTParams(min_score=bt_score, max_hold=int(bt_hold),
-                            target_r=1.5 if bt_target.startswith("هدف ۱") else 3.0,
+                            target_r=float(bt_target_r),
                             fee_round_trip=fee, min_avg_value=params.min_avg_value, lookback=int(bt_days))
     if st.button("▶️ اجرای بک‌تست روی همه نمادها", type="primary"):
         bar = st.progress(0.0)
@@ -515,8 +588,72 @@ with tabs[5]:
                                        "قیمت خروج": st.column_config.NumberColumn(format="localized")})
             st.caption("نتایج گذشته تضمینی برای آینده نیست. لغزش قیمت، صف‌ها و محدودیت حجم در عمل نتیجه را بدتر می‌کنند.")
 
-# ---------------------------------------------------------------- telegram
+# ------------------------------------------------------------------ memory
 with tabs[6]:
+    st.subheader("🧠 حافظه و تنظیم خودکار")
+    st.markdown("""
+**حافظه:** جریان پول حقیقی روزانه همه نمادها (خرید و فروش حقیقی) در یک پایگاه داده روی همین کامپیوتر ذخیره
+می‌شود. بار اول سابقه کامل از TSETMC گرفته می‌شود و بعد هر روز داده همان روز اضافه می‌شود. از این حافظه
+الگوهایی مثل «چند روز متوالی ورود پول حقیقی» و «قدرت خریدار ۵ روزه» در امتیاز نوسان‌گیری استفاده می‌شوند.
+امتیاز روزانه نمادها هم ذخیره می‌شود تا روند آن‌ها قابل دیدن باشد.
+
+**تنظیم خودکار (هفتگی):** همه ترکیب‌های حداقل امتیاز، مهلت نگهداری و هدف روی داده‌های گذشته آزموده می‌شوند.
+بهترین ترکیب فقط وقتی جایگزین پیش‌فرض می‌شود که روی **چند هفته اخیر که در جستجو استفاده نشده** هم بهتر باشد؛
+این جلوی «حفظ کردن گذشته» (بیش‌برازش) را می‌گیرد.
+""")
+    if origin == "TSETMC":
+        ms = memory.stats()
+        c = st.columns(4)
+        c[0].metric("نمادهای در حافظه", f"{ms['symbols'] or 0:,}")
+        c[1].metric("روزهای پول حقیقی", f"{ms['flow_days'] or 0:,}")
+        c[2].metric("روزهای امتیاز ذخیره‌شده", f"{ms['score_days'] or 0:,}")
+        c[3].metric("بازه حافظه", f"{ms['first'] or '—'} تا {ms['last'] or '—'}")
+        st.caption(f"محل پایگاه داده: {config.data_dir() / 'memory.db'}")
+    else:
+        st.info("در حالت داده نمونه چیزی در حافظه ذخیره نمی‌شود؛ تنظیم خودکار فقط برای همین جلسه اجرا می‌شود.")
+
+    st.divider()
+    use_t = st.toggle("استفاده از پارامترهای تنظیم خودکار در داشبورد و هشدارها", cfg["use_tuned"])
+    if use_t != cfg["use_tuned"]:
+        cfg["use_tuned"] = use_t
+        config.save(cfg)
+        st.rerun()
+    if st.button("🔁 اجرای تنظیم خودکار همین حالا"):
+        with st.spinner("در حال آزمودن همه ترکیب‌ها…"):
+            res = tuner.tune(frames, fee=fee, min_avg_value=params.min_avg_value, store=not is_demo)
+            if is_demo:
+                st.session_state["demo_tuning"] = res
+        st.rerun()
+    if tuning:
+        (st.success if tuning["adopted"] else st.info)(f"{tuning['reason']} (تاریخ اجرا: {tuning['date']})")
+        if tuning.get("grid"):
+            st.caption(f"دوره آموزش: {tuning['first']} تا {tuning['split']} · دوره آزمون (دیده‌نشده): "
+                       f"{tuning['split']} تا {tuning['last']}")
+
+            def row(name, r):
+                return {"": name, "حداقل امتیاز": r["min_score"], "مهلت (روز)": r["max_hold"],
+                        "هدف (×ریسک)": r["target_r"],
+                        "معاملات آموزش": r["train_trades"], "میانگین سود آموزش٪": r["train_avg"],
+                        "معاملات آزمون": r["test_trades"], "میانگین سود آزمون٪": r["test_avg"],
+                        "درصد برد آزمون": r["test_win"]}
+            comp = pd.DataFrame([row("بهترین ترکیب", tuning["best"]), row("پیش‌فرض", tuning["default"])])
+            st.dataframe(comp, hide_index=True, width="stretch", column_config={
+                k: st.column_config.NumberColumn(format="%.2f")
+                for k in ("میانگین سود آموزش٪", "میانگین سود آزمون٪", "درصد برد آزمون")})
+            g = pd.DataFrame(tuning["grid"])
+            g = g[g["target_r"] == tuning["best"]["target_r"]]
+            heat = g.pivot_table(index="max_hold", columns="min_score", values="test_avg")
+            figh = px.imshow(heat, text_auto=".2f", color_continuous_scale="RdYlGn", aspect="auto",
+                             color_continuous_midpoint=0,
+                             labels={"x": "حداقل امتیاز", "y": "مهلت نگهداری (روز)", "color": "سود٪"})
+            figh.update_layout(title=f"میانگین سود خالص هر معامله در دوره آزمون (هدف {tuning['best']['target_r']:g} برابر ریسک)",
+                               height=320, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(figh, width="stretch")
+            st.caption("اگر خانه‌های اطراف بهترین ترکیب هم سبز باشند، نتیجه پایدارتر است؛ "
+                       "یک خانه سبز تنها میان خانه‌های قرمز احتمالاً شانسی است.")
+
+# ---------------------------------------------------------------- telegram
+with tabs[7]:
     st.subheader("🔔 هشدار تلگرام")
     with st.expander("راهنمای راه‌اندازی (یک بار)", expanded=not cfg["telegram_token"]):
         st.markdown("""
@@ -534,7 +671,11 @@ with tabs[6]:
         chat_id = st.text_input("شناسه چت (chat id)", cfg["telegram_chat_id"])
         proxy = st.text_input("پروکسی (اختیاری)", cfg["telegram_proxy"])
     with b:
-        min_alert = st.slider("حداقل امتیاز نوسان‌گیری برای هشدار", 50, 100, int(cfg["alert_min_score"]))
+        min_alert = st.slider("حداقل امتیاز نوسان‌گیری برای هشدار", 50, 100, int(cfg["alert_min_score"]),
+                              disabled=bool(cfg["use_tuned"] and tuning and tuning.get("adopted")))
+        st.caption(f"آستانه فعلی هشدار: {alerts.alert_threshold(cfg, tuning):g}"
+                   + (" (از تنظیم خودکار؛ در تب حافظه قابل خاموش کردن است)"
+                      if cfg["use_tuned"] and tuning and tuning.get("adopted") else ""))
         interval = st.number_input("فاصله بررسی (دقیقه)", 5, 240, int(cfg["alert_interval_min"]), step=5)
         lt_daily = st.checkbox("ارسال روزانه برترین‌های بلندمدت", cfg["alert_long_term"])
         codal_ev = st.checkbox("ارسال اطلاعیه‌های مهم کدال برای نمادهای هشدار داده‌شده", cfg["alert_codal_events"])
@@ -568,7 +709,8 @@ with tabs[6]:
             st.error(str(e))
     if c[3].button("🚀 ارسال هشدارهای همین حالا", width="stretch"):
         try:
-            n = alerts.run_once(new_cfg, market=market, histories=histories, log=lambda *_: None)
+            n = alerts.run_once(new_cfg, market=market, histories=histories, flows=flows,
+                                store=origin == "TSETMC", tuning=tuning, log=lambda *_: None)
             st.success(f"{n} پیام ارسال شد (نمادهایی که امروز قبلاً اعلام شده‌اند تکرار نمی‌شوند).")
         except alerts.TelegramError as e:
             st.error(str(e))
@@ -592,7 +734,7 @@ with tabs[6]:
         st.caption("هشدار خودکار همیشه از داده زنده TSETMC استفاده می‌کند، نه داده نمونه.")
 
 # -------------------------------------------------------------------- help
-with tabs[7]:
+with tabs[8]:
     st.markdown(f"""
 ### امتیاز نوسان‌گیری (۰ تا ۱۰۰)
 | عامل | منطق |
@@ -602,6 +744,7 @@ with tabs[7]:
 | حجم | حجم بیش از ۱.۵ برابر میانگین ۲۰ روزه همراه جهت قیمت |
 | شکست | عبور از سقف ۲۰ روزه و باند بالای بولینگر |
 | پول حقیقی | قدرت خریدار حقیقی (سرانه خرید ÷ سرانه فروش) و خالص ورود پول |
+| حافظه | ورود یا خروج پول حقیقی ۳ روز متوالی یا بیشتر، و قدرت خریدار ۵ روزه |
 | فیلترها | صف فروش و نقدشوندگی پایین امتیاز را کم می‌کنند |
 
 ### امتیاز بلندمدت (۰ تا ۱۰۰)

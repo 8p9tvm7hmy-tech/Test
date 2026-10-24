@@ -21,10 +21,12 @@ import config  # noqa: F401
 import data  # noqa: F401
 import demo  # noqa: F401
 import indicators  # noqa: F401
+import memory  # noqa: F401
 import plotly.express  # noqa: F401
 import plotly.graph_objects  # noqa: F401
 import plotly.subplots  # noqa: F401
 import sectors  # noqa: F401
+import tuner  # noqa: F401
 from streamlit.web import cli as stcli
 
 

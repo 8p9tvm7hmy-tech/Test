@@ -22,6 +22,7 @@ DEFAULTS = {
     "alert_long_term": True,       # one daily message with the top long-term picks
     "alert_codal_events": True,    # important Codal announcements for alerted symbols
     "alert_outside_hours": False,
+    "use_tuned": True,             # use the auto-tuned score threshold / target / holding days
     "min_avg_value": 5e9,
     "max_symbols": 0,
 }

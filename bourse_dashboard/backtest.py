@@ -1,11 +1,11 @@
 """Backtest of the swing (نوسان‌گیری) signals on past daily data.
 
-The live score also uses today's individual/institutional money flow, which
-TSETMC doesn't provide historically, so the backtest uses the technical part of
-the score only (technical_score_series mirrors analysis.swing_analysis).
+score_series mirrors analysis.swing_analysis: the technical rules always, plus the
+money-flow and memory rules on days where the stored individual money flow
+(memory) exists. Without memory only the technical part is tested.
 
 Rules per symbol, one position at a time:
-  * signal: technical score >= min_score at a day's close
+  * signal: score >= min_score at a day's close
   * entry:  next day's open (skipped if that day is a locked queue, high == low)
   * stop / target: as in the live analysis (ATR and 10-day low; target = k × risk)
   * exit:   stop first if both are touched the same day (conservative), gaps fill
@@ -32,8 +32,8 @@ class BTParams:
     lookback: int = 250           # فقط سیگنال‌های این تعداد روز اخیر
 
 
-def technical_score_series(df: pd.DataFrame, min_avg_value: float = 0) -> pd.Series:
-    """Technical part of the swing score for every day (df must contain indicators)."""
+def score_series(df: pd.DataFrame, min_avg_value: float = 0) -> pd.Series:
+    """Swing score for every day (df must contain indicators, optionally flow features)."""
     c, r = df["close"], df["rsi"]
     hist = df["macd_hist"]
     s = pd.Series(45.0, index=df.index)
@@ -57,56 +57,73 @@ def technical_score_series(df: pd.DataFrame, min_avg_value: float = 0) -> pd.Ser
     s += np.where(c >= df["high"].shift().rolling(20).max(), 6, 0)
     s += np.where((c > df["bb_up"]) & (r < 75), 3, np.where((c < df["bb_low"]) & (r >= 30), -3, 0))
     s += np.where(df["value"].rolling(20).mean() < min_avg_value, -5, 0)
+    if "bp" in df.columns:
+        bp, ni = df["bp"], df["net_ind"]
+        s += np.select([bp >= 1.5, bp >= 1.2, bp < 0.8], [8, 4, -6], 0)
+        s += np.where(ni > 0, 3, np.where(ni < 0, -3, 0))
+        mem = df["flow_days"] >= 5
+        s += np.where(mem & (df["in_streak"] >= 3), 4, 0)
+        s += np.where(mem & (df["out_streak"] >= 3), -4, 0)
+        s += np.where(mem & (df["net5"] > 0) & (df["bp5"] >= 1.2), 3, 0)
     s = s.clip(0, 100)
     s.iloc[:59] = np.nan  # live analysis needs at least 60 days
     return s
 
 
+OPEN = "open"  # trade_at result for a position still open at the end of the data
+
+
+def prepare(df: pd.DataFrame, min_avg_value: float = 0) -> dict:
+    """Numpy arrays used by trade_at (computed once per symbol)."""
+    return {
+        "score": score_series(df, min_avg_value).to_numpy(),
+        **{k: df[k].to_numpy() for k in ("open", "high", "low", "close", "atr")},
+        "low10": df["low"].rolling(10).min().to_numpy(),
+        "dates": df.index,
+    }
+
+
+def trade_at(a: dict, i: int, max_hold: int, target_r: float):
+    """Trade for a signal at day i's close: None (no fill), OPEN, or (e, j, entry, exit, reason)."""
+    o, h, l, c, atr = a["open"], a["high"], a["low"], a["close"], a["atr"]
+    n, e = len(c), i + 1
+    if e >= n or np.isnan(atr[i]) or h[e] == l[e]:   # no next day, or a locked queue that won't fill
+        return None
+    stop = max(c[i] - 2 * atr[i], a["low10"][i])
+    if stop >= c[i]:
+        stop = c[i] - 1.5 * atr[i]
+    entry = o[e]
+    if entry <= stop:                                  # gapped below the stop
+        return None
+    target = entry + target_r * (c[i] - stop)
+    for j in range(e, n):
+        if l[j] <= stop:
+            return e, j, entry, (min(o[j], stop) if j > e else stop), "حد ضرر"
+        if h[j] >= target:
+            return e, j, entry, (max(o[j], target) if j > e else target), "هدف"
+        if j - e + 1 >= max_hold:
+            return e, j, entry, c[j], "پایان مهلت"
+    return OPEN
+
+
 def simulate(df: pd.DataFrame, p: BTParams, symbol: str = "") -> list[dict]:
     if len(df) < 80:
         return []
-    score = technical_score_series(df, p.min_avg_value).to_numpy()
-    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
-    atr = df["atr"].to_numpy()
-    low10 = df["low"].rolling(10).min().to_numpy()
-    dates = df.index
-    start = max(60, len(df) - p.lookback)
-    trades, i = [], start
+    a = prepare(df, p.min_avg_value)
+    score, dates = a["score"], a["dates"]
+    trades, i = [], max(60, len(df) - p.lookback)
     while i < len(df) - 1:
-        if not (score[i] >= p.min_score) or np.isnan(atr[i]):
+        t = trade_at(a, i, p.max_hold, p.target_r) if score[i] >= p.min_score else None
+        if t is None:
             i += 1
             continue
-        e = i + 1
-        if h[e] == l[e]:          # locked queue: an order would not fill
-            i += 1
-            continue
-        stop = max(c[i] - 2 * atr[i], low10[i])
-        if stop >= c[i]:
-            stop = c[i] - 1.5 * atr[i]
-        entry = o[e]
-        target = entry + p.target_r * (c[i] - stop)
-        if entry <= stop:         # gapped below the stop: skip the trade
-            i += 1
-            continue
-        exit_px, reason, j = None, "", e
-        while j < len(df):
-            if l[j] <= stop:
-                exit_px, reason = (min(o[j], stop) if j > e else stop), "حد ضرر"
-                break
-            if h[j] >= target:
-                exit_px, reason = (max(o[j], target) if j > e else target), "هدف"
-                break
-            if j - e + 1 >= p.max_hold:
-                exit_px, reason = c[j], "پایان مهلت"
-                break
-            j += 1
-        if exit_px is None:       # still open at the end of the data
+        if t == OPEN:
             break
-        ret = (exit_px / entry - 1) * 100 - p.fee_round_trip
+        e, j, entry, exit_px, reason = t
         trades.append({
             "symbol": symbol, "signal_date": dates[i], "entry_date": dates[e], "exit_date": dates[j],
             "score": score[i], "entry": entry, "exit": exit_px, "days": j - e + 1,
-            "reason": reason, "return_pct": ret,
+            "reason": reason, "return_pct": (exit_px / entry - 1) * 100 - p.fee_round_trip,
         })
         i = j + 1
     return trades

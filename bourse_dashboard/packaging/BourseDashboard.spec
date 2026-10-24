@@ -4,7 +4,8 @@ import os
 from PyInstaller.utils.hooks import collect_all
 
 src = os.path.abspath(os.path.join(SPECPATH, ".."))
-modules = ["app", "alerts", "analysis", "backtest", "codal", "config", "data", "demo", "indicators", "sectors"]
+modules = ["app", "alerts", "analysis", "backtest", "codal", "config", "data", "demo", "indicators",
+           "memory", "sectors", "tuner"]
 
 datas, binaries, hidden = [], [], []
 for pkg in ("streamlit", "plotly"):

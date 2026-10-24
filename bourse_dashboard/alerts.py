@@ -23,6 +23,8 @@ import requests
 import analysis as an
 import config
 import data
+import memory
+import tuner
 
 TEHRAN = ZoneInfo("Asia/Tehran")
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -86,6 +88,7 @@ def swing_message(r: pd.Series) -> str:
         f"قیمت: {fmt(r['close'])} ({r['change_pct']:+.2f}٪)\n"
         f"🎯 هدف ۱: {fmt(r['target1'])} · هدف ۲: {fmt(r['target2'])}\n"
         f"🛑 حد ضرر: {fmt(r['stop'])} ({r['stop_pct']:.1f}٪)\n"
+        f"⏳ مهلت نگهداری: {int(r['max_hold'])} روز\n"
         f"تعداد پیشنهادی: {fmt(r['shares'])} سهم\n\n{reasons}"
     )
 
@@ -131,10 +134,18 @@ def market_open(now: datetime | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------- scan
-def pick_new_alerts(swing: pd.DataFrame, cfg: dict, already: set) -> pd.DataFrame:
+def alert_threshold(cfg: dict, tuning: dict | None = None) -> float:
+    """Auto-tuned minimum score when enabled, otherwise the user's own setting."""
+    if cfg.get("use_tuned") and tuning and tuning.get("adopted"):
+        return tuning["params"]["min_score"]
+    return cfg["alert_min_score"]
+
+
+def pick_new_alerts(swing: pd.DataFrame, cfg: dict, already: set, threshold: float | None = None) -> pd.DataFrame:
     if swing.empty:
         return swing
-    s = swing[(swing["score"] >= cfg["alert_min_score"]) & (~swing["buy_queue"])
+    threshold = cfg["alert_min_score"] if threshold is None else threshold
+    s = swing[(swing["score"] >= threshold) & (~swing["buy_queue"])
               & (swing["avg_value20"] >= cfg["min_avg_value"])]
     return s[~s["ins_code"].isin(already)]
 
@@ -152,16 +163,30 @@ def codal_events(symbols) -> list[str]:
     return out
 
 
-def run_once(cfg: dict | None = None, market=None, histories=None, log=print) -> int:
-    """One scan; returns the number of messages sent."""
+def run_once(cfg: dict | None = None, market=None, histories=None, flows=None, store: bool | None = None,
+             tuning: dict | None = None, log=print) -> int:
+    """One scan; returns the number of messages sent.
+
+    Without market data it loads live data and updates memory (store=True). The dashboard
+    passes its own data; store=False (demo data) keeps memory untouched.
+    """
     cfg = cfg or config.load()
     if market is None:
         market, histories = data.load_market_and_histories(int(cfg.get("max_symbols") or 0))
-    params = an.Params(min_avg_value=cfg["min_avg_value"])
-    swing, lt, _ = an.scan(market, histories, params)
+        flows = memory.refresh(market, list(histories))
+        store = True if store is None else store
+    store = bool(store)
+    tuning = tuning if tuning is not None else tuner.latest()
+    tp = tuning["params"] if (tuning and cfg.get("use_tuned")) else tuner.DEFAULT
+    params = an.Params(min_avg_value=cfg["min_avg_value"], target_r=tp["target_r"], max_hold=tp["max_hold"])
+    swing, lt, frames = an.scan(market, histories, params, flows)
+    if store:
+        memory.save_scores(swing, lt)
+        if tuner.is_stale():
+            tuning = tuner.tune(frames, min_avg_value=cfg["min_avg_value"])
     state, sent = _load_state(), 0
 
-    new = pick_new_alerts(swing, cfg, set(state["swing"]))
+    new = pick_new_alerts(swing, cfg, set(state["swing"]), alert_threshold(cfg, tuning))
     for _, r in new.iterrows():
         send(cfg, swing_message(r) + DISCLAIMER)
         state["swing"].append(r["ins_code"])

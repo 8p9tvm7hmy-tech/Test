@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from analysis import session_date
 from data import finalize_market
 from sectors import SECTORS
 
@@ -15,7 +16,9 @@ from sectors import SECTORS
 def demo_market(n_symbols: int = 150, days: int = 500, seed: int = 7):
     rng = np.random.default_rng(seed)
     sectors = list(SECTORS)
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    # Tehran trading calendar: Saturday–Wednesday, ending at the current session.
+    cal = pd.date_range(end=session_date(), periods=days * 2, freq="D")
+    dates = cal[~cal.weekday.isin([3, 4])][-days:]
     rows, histories = [], {}
     for i in range(n_symbols):
         code = f"DEMO{i:04d}"
@@ -57,3 +60,22 @@ def demo_market(n_symbols: int = 150, days: int = 500, seed: int = 7):
             "sell_vol_i": ind_sell, "sell_vol_n": tot - ind_sell if tot > ind_sell else 0,
         })
     return finalize_market(pd.DataFrame(rows), filter_symbols=False), histories
+
+
+def demo_flows(histories: dict, seed: int = 11) -> dict:
+    """Synthetic individual money flow for the demo symbols (never written to memory)."""
+    rng = np.random.default_rng(seed)
+    out = {}
+    for code, h in histories.items():
+        ret = h["close"].pct_change().fillna(0).to_numpy()
+        n = len(h)
+        # Flow leans with the same day's move, like the real market — no look-ahead.
+        tilt = np.clip(1 + 8 * ret + rng.normal(0, 0.15, n), 0.2, 2.0)
+        vol = h["volume"].to_numpy()
+        out[code] = pd.DataFrame({
+            "buy_count_i": rng.integers(50, 3000, n).astype(float),
+            "sell_count_i": rng.integers(50, 3000, n).astype(float),
+            "buy_vol_i": vol * rng.uniform(0.4, 0.9, n) * tilt,
+            "sell_vol_i": vol * rng.uniform(0.4, 0.9, n) / tilt,
+        }, index=h.index)
+    return out

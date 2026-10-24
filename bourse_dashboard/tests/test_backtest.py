@@ -21,9 +21,36 @@ def test_score_series_matches_live_analysis():
                          "buy_queue": False, "sell_queue": False})
     for df in hist.values():
         d = ind.add_all(df)
-        s = bt.technical_score_series(d, p.min_avg_value)
+        s = bt.score_series(d, p.min_avg_value)
         for k in (60, 200, len(d)):
             assert s.iloc[k - 1] == pytest.approx(an.swing_analysis(d.iloc[:k], no_flow, p)["score"])
+
+
+def test_score_series_with_memory_matches_live_analysis():
+    market, hist = demo.demo_market(n_symbols=15, days=320)
+    flows = demo.demo_flows(hist)
+    p = an.Params()
+    row = pd.Series({"buyer_power": np.nan, "net_individual": np.nan, "buy_queue": False, "sell_queue": False})
+    used_memory = 0
+    for code, df in hist.items():
+        d = an.add_flow_features(ind.add_all(df), flows[code])
+        s = bt.score_series(d, p.min_avg_value)
+        for k in (60, 61, 64, 200, len(d)):
+            live = an.swing_analysis(d.iloc[:k], row, p)
+            used_memory += any("حافظه" in r for r in live["reasons"])
+            assert s.iloc[k - 1] == pytest.approx(live["score"]), (code, k)
+    assert used_memory  # the memory rules were actually exercised
+
+
+def test_flow_features_streaks():
+    idx = pd.date_range("2024-01-01", periods=6)
+    h = pd.DataFrame({"close": 100.0}, index=idx)
+    flow = pd.DataFrame({"buy_count_i": 10.0, "sell_count_i": 10.0,
+                         "buy_vol_i": [5, 9, 9, 9, 1, 9.0], "sell_vol_i": 5.0}, index=idx)
+    out = an.add_flow_features(h, flow)
+    assert out["in_streak"].tolist() == [0, 1, 2, 3, 0, 1]
+    assert out["out_streak"].tolist() == [0, 0, 0, 0, 1, 0]
+    assert out["bp"].iloc[1] == pytest.approx(9 / 5)
 
 
 def frame(n=100):
@@ -42,7 +69,7 @@ def run_one(df, monkeypatch, signal_day, **kw):
     df["atr"] = 20.0
     score = pd.Series(0.0, index=df.index)
     score.iloc[signal_day] = 90
-    monkeypatch.setattr(bt, "technical_score_series", lambda d, m=0: score)
+    monkeypatch.setattr(bt, "score_series", lambda d, m=0: score)
     p = bt.BTParams(min_score=80, fee_round_trip=1.0, lookback=1000, **kw)
     return bt.simulate(df, p, "X")
 

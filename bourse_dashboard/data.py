@@ -153,12 +153,12 @@ def _market_watch_old() -> pd.DataFrame:
 def _client_types_new() -> pd.DataFrame:
     rows = _get(f"{NEW_API}/ClientType/GetClientTypeAll").json().get("clientTypeAllDto") or []
     keys = {
-        "buy_count_i": "buy_CountI", "buy_count_n": "buy_CountN",
-        "buy_vol_i": "buy_I_Volume", "buy_vol_n": "buy_N_Volume",
-        "sell_count_i": "sell_CountI", "sell_count_n": "sell_CountN",
-        "sell_vol_i": "sell_I_Volume", "sell_vol_n": "sell_N_Volume",
+        "buy_count_i": ("buy_I_Count", "buy_CountI"), "buy_count_n": ("buy_N_Count", "buy_CountN"),
+        "buy_vol_i": ("buy_I_Volume",), "buy_vol_n": ("buy_N_Volume",),
+        "sell_count_i": ("sell_I_Count", "sell_CountI"), "sell_count_n": ("sell_N_Count", "sell_CountN"),
+        "sell_vol_i": ("sell_I_Volume",), "sell_vol_n": ("sell_N_Volume",),
     }
-    out = [{"ins_code": str(r.get("insCode")), **{k: _num(r.get(v)) for k, v in keys.items()}}
+    out = [{"ins_code": str(r.get("insCode")), **{k: _num(_pick(r, *v)) for k, v in keys.items()}}
            for r in rows]
     if not out:
         raise DataError("داده حقیقی/حقوقی خالی بود")
@@ -331,3 +331,45 @@ def load_market_and_histories(max_symbols: int = 0, progress=None):
     if max_symbols:
         universe = universe.head(max_symbols)
     return market, fetch_histories(universe["ins_code"], progress=progress)
+
+
+# ------------------------------------------------- individual money flow history
+FLOW_COLUMNS = ["buy_count_i", "sell_count_i", "buy_vol_i", "sell_vol_i"]
+
+
+def _flow_history_new(ins_code: str) -> pd.DataFrame:
+    rows = _get(f"{NEW_API}/ClientType/GetClientTypeHistory/{ins_code}").json().get("clientType") or []
+    return pd.DataFrame([{
+        "date": str(r.get("recDate")),
+        "buy_count_i": _num(_pick(r, "buy_I_Count", "buy_CountI")),
+        "sell_count_i": _num(_pick(r, "sell_I_Count", "sell_CountI")),
+        "buy_vol_i": _num(r.get("buy_I_Volume")),
+        "sell_vol_i": _num(r.get("sell_I_Volume")),
+    } for r in rows])
+
+
+def _flow_history_old(ins_code: str) -> pd.DataFrame:
+    # date, buy_count_i, buy_count_n, sell_count_i, sell_count_n, buy_vol_i, buy_vol_n, sell_vol_i, ...
+    text = _get(f"{OLD_API}/clienttype.aspx?i={ins_code}").text
+    out = []
+    for row in text.split(";"):
+        f = row.split(",")
+        if len(f) >= 9:
+            out.append({"date": f[0], "buy_count_i": _num(f[1]), "sell_count_i": _num(f[3]),
+                        "buy_vol_i": _num(f[5]), "sell_vol_i": _num(f[7])})
+    return pd.DataFrame(out)
+
+
+def fetch_flow_history(ins_code: str) -> pd.DataFrame:
+    """Daily individual (حقیقی) buy/sell counts and volumes; date as YYYY-MM-DD."""
+    for fn in (_flow_history_new, _flow_history_old):
+        try:
+            df = fn(ins_code)
+        except Exception:  # noqa: BLE001 - try the next source
+            continue
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"].str[:8], format="%Y%m%d", errors="coerce")
+            df = df.dropna(subset=["date"])
+            df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+            return df[["date", *FLOW_COLUMNS]]
+    raise DataError(f"سابقه حقیقی/حقوقی {ins_code} دریافت نشد")
