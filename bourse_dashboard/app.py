@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 
 import alerts
 import analysis as an
+import backtest as bt
 import codal
 import config
 import data
@@ -133,7 +134,7 @@ def codal_sales(symbol):
 
 
 tabs = st.tabs(["📊 نمای بازار", "⚡ نوسان‌گیری (کوتاه‌مدت)", "🏦 سرمایه‌گذاری (بلندمدت)",
-                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "🔔 هشدار تلگرام", "ℹ️ راهنما"])
+                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "🧪 بک‌تست", "🔔 هشدار تلگرام", "ℹ️ راهنما"])
 
 # ---------------------------------------------------------------- overview
 with tabs[0]:
@@ -432,8 +433,90 @@ with tabs[4]:
         else:
             st.error("حد ضرر باید کمتر از قیمت ورود باشد.")
 
-# ---------------------------------------------------------------- telegram
+# ---------------------------------------------------------------- backtest
 with tabs[5]:
+    st.subheader("🧪 بک‌تست استراتژی نوسان‌گیری")
+    st.caption("اگر در گذشته به هر سیگنال نوسان‌گیری عمل می‌کردیم چه می‌شد؟ ورود: قیمت باز شدن روز بعد از سیگنال؛ "
+               "خروج: حد ضرر، هدف یا پایان مهلت؛ کارمزد از هر معامله کم می‌شود. جریان پول حقیقی روزهای گذشته "
+               "در دسترس نیست، پس فقط بخش تکنیکال امتیاز آزموده می‌شود.")
+    if origin == "نمونه":
+        st.warning("روی داده ساختگی (تصادفی) نتیجه باید نزدیک صفر باشد؛ نتیجه واقعی را با داده TSETMC ببینید.")
+    f = st.columns(5)
+    bt_score = f[0].slider("حداقل امتیاز سیگنال", 50, 95, 65, step=5)
+    bt_hold = f[1].number_input("حداکثر روز نگهداری", 1, 60, 10)
+    bt_target = f[2].selectbox("هدف خروج", ["هدف ۱ (۱.۵ برابر ریسک)", "هدف ۲ (۳ برابر ریسک)"])
+    bt_days = f[3].number_input("بازه آزمون (روز معاملاتی اخیر)", 60, 2000, 250, step=50)
+    bt_pos = f[4].slider("سهم هر معامله از سرمایه (٪)", 5, 100, 20, step=5)
+    bt_params = bt.BTParams(min_score=bt_score, max_hold=int(bt_hold),
+                            target_r=1.5 if bt_target.startswith("هدف ۱") else 3.0,
+                            fee_round_trip=fee, min_avg_value=params.min_avg_value, lookback=int(bt_days))
+    if st.button("▶️ اجرای بک‌تست روی همه نمادها", type="primary"):
+        bar = st.progress(0.0)
+        names = dict(zip(market["ins_code"], market["symbol"]))
+        st.session_state["bt"] = bt.run(frames, names, bt_params,
+                                        progress=lambda d, t: bar.progress(d / t, text=f"{d} از {t} نماد"))
+        bar.empty()
+    trades = st.session_state.get("bt")
+    if trades is not None:
+        sm = bt.summary(trades)
+        if not sm["trades"]:
+            st.info("با این تنظیمات هیچ معامله‌ای انجام نشد.")
+        else:
+            curve = bt.equity_curve(trades, bt_pos)
+            m = st.columns(6)
+            m[0].metric("تعداد معاملات", f"{sm['trades']:,}")
+            m[1].metric("درصد برد", f"{sm['win_rate']:.0f}٪")
+            m[2].metric("میانگین سود خالص هر معامله", f"{sm['avg_return']:+.2f}٪")
+            m[3].metric("ضریب سود (Profit factor)", f"{sm['profit_factor']:.2f}")
+            m[4].metric("میانگین روز نگهداری", f"{sm['avg_days']:.1f}")
+            m[5].metric("بیشترین افت سرمایه", f"{bt.max_drawdown(curve):.0f}٪",
+                        help="روی منحنی سرمایه، با محدودیت تعداد معاملات هم‌زمان.")
+            st.caption(f"میانگین برد: {sm['avg_win']:+.2f}٪ · میانگین باخت: {sm['avg_loss']:+.2f}٪ · "
+                       "ضریب سود بالای ۱ یعنی جمع سودها از جمع زیان‌ها بیشتر بوده است.")
+
+            l, r = st.columns(2)
+            fig = go.Figure(go.Scatter(x=curve.index, y=curve.values, line=dict(color="#16a34a")))
+            fig.add_hline(y=100, line=dict(color="gray", dash="dot"))
+            n_taken = len(bt.portfolio(trades, bt_pos))
+            fig.update_layout(title=f"رشد ۱۰۰ واحد سرمایه: حداکثر {int(100 // bt_pos)} معامله هم‌زمان، "
+                                    f"{n_taken:,} معامله قابل انجام",
+                              height=360, margin=dict(l=10, r=10, t=40, b=10))
+            l.plotly_chart(fig, width="stretch")
+            bk = bt.by_score_bucket(trades)
+            fig = go.Figure(go.Bar(x=bk["bucket"].astype(str), y=bk["avg_return"],
+                                   marker_color=np.where(bk["avg_return"] >= 0, "#16a34a", "#dc2626"),
+                                   text=bk["trades"], hovertemplate="%{y:.2f}٪ · %{text} معامله<extra></extra>"))
+            fig.update_layout(title="میانگین سود خالص بر اساس امتیاز سیگنال (آیا امتیاز بالاتر بهتر است؟)",
+                              height=360, margin=dict(l=10, r=10, t=40, b=10))
+            r.plotly_chart(fig, width="stretch")
+
+            l, r = st.columns([1, 2])
+            reasons = trades["reason"].value_counts()
+            l.markdown("**دلیل خروج**")
+            l.dataframe(reasons.rename_axis("دلیل").reset_index(name="تعداد"), hide_index=True, width="stretch")
+            per = (trades.groupby("symbol")["return_pct"].agg(["count", "mean", "sum"])
+                   .sort_values("sum", ascending=False).reset_index())
+            per.columns = ["نماد", "تعداد", "میانگین٪", "جمع٪"]
+            l.markdown("**بهترین نمادها**")
+            l.dataframe(per.head(10), hide_index=True, width="stretch",
+                        column_config={k: st.column_config.NumberColumn(format="%.1f") for k in ("میانگین٪", "جمع٪")})
+            r.markdown("**آخرین معاملات**")
+            show = trades.sort_values("exit_date", ascending=False).head(300).assign(
+                entry_date=lambda d: d["entry_date"].dt.strftime("%Y-%m-%d"),
+                exit_date=lambda d: d["exit_date"].dt.strftime("%Y-%m-%d"),
+                entry=lambda d: d["entry"].round(0), exit=lambda d: d["exit"].round(0))
+            cols = {"symbol": "نماد", "entry_date": "تاریخ ورود", "exit_date": "تاریخ خروج", "score": "امتیاز",
+                    "entry": "قیمت ورود", "exit": "قیمت خروج", "days": "روز", "reason": "دلیل خروج",
+                    "return_pct": "سود خالص٪"}
+            r.dataframe(show[list(cols)].rename(columns=cols), hide_index=True, width="stretch", height=420,
+                        column_config={"سود خالص٪": st.column_config.NumberColumn(format="%.2f"),
+                                       "امتیاز": st.column_config.NumberColumn(format="%.0f"),
+                                       "قیمت ورود": st.column_config.NumberColumn(format="localized"),
+                                       "قیمت خروج": st.column_config.NumberColumn(format="localized")})
+            st.caption("نتایج گذشته تضمینی برای آینده نیست. لغزش قیمت، صف‌ها و محدودیت حجم در عمل نتیجه را بدتر می‌کنند.")
+
+# ---------------------------------------------------------------- telegram
+with tabs[6]:
     st.subheader("🔔 هشدار تلگرام")
     with st.expander("راهنمای راه‌اندازی (یک بار)", expanded=not cfg["telegram_token"]):
         st.markdown("""
@@ -509,7 +592,7 @@ with tabs[5]:
         st.caption("هشدار خودکار همیشه از داده زنده TSETMC استفاده می‌کند، نه داده نمونه.")
 
 # -------------------------------------------------------------------- help
-with tabs[6]:
+with tabs[7]:
     st.markdown(f"""
 ### امتیاز نوسان‌گیری (۰ تا ۱۰۰)
 | عامل | منطق |

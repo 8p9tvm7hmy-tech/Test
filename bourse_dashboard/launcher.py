@@ -15,6 +15,7 @@ import webbrowser
 # Imported here so PyInstaller bundles them; app.py itself is loaded by Streamlit at runtime.
 import alerts  # noqa: F401
 import analysis  # noqa: F401
+import backtest  # noqa: F401
 import codal  # noqa: F401
 import config  # noqa: F401
 import data  # noqa: F401
