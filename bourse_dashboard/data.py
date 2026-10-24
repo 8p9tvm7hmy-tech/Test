@@ -10,16 +10,15 @@ Everything is normalised into two shapes:
 """
 from __future__ import annotations
 
-import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 
+import config
 from sectors import sector_name
 
 NEW_API = "https://cdn.tsetmc.com/api"
@@ -30,7 +29,7 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.tsetmc.com/",
 }
-CACHE_DIR = Path(os.environ.get("BOURSE_CACHE", Path(__file__).parent / ".cache"))
+CACHE_DIR = config.data_dir() / "cache"
 
 # Instrument type codes (yval) that are ordinary shares: 300 بورس, 303 فرابورس, 309 پایه.
 STOCK_TYPES = {"300", "303", "309"}
@@ -323,3 +322,12 @@ def fetch_histories(ins_codes, workers: int = 6, progress=None, **kw) -> dict:
             if progress:
                 progress(i, total)
     return result
+
+
+def load_market_and_histories(max_symbols: int = 0, progress=None):
+    """Market watch plus daily histories for every traded share (most traded first)."""
+    market = fetch_market_watch()
+    universe = market[market["volume"] > 0].sort_values("value", ascending=False)
+    if max_symbols:
+        universe = universe.head(max_symbols)
+    return market, fetch_histories(universe["ins_code"], progress=progress)

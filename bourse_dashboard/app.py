@@ -10,7 +10,10 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import alerts
 import analysis as an
+import codal
+import config
 import data
 import demo
 import indicators as ind
@@ -38,13 +41,20 @@ SIGNAL_COLORS = {"خرید قوی": "#15803d", "خرید": "#22c55e", "خنثی"
 BILLION = 1e9
 
 # ------------------------------------------------------------------ sidebar
+cfg = config.load()
+
 with st.sidebar:
     st.header("⚙️ تنظیمات")
     source = st.radio("منبع داده", ["TSETMC (زنده)", "داده نمونه (آزمایشی)"])
     min_value_b = st.number_input("حداقل میانگین ارزش معاملات روزانه (میلیارد ریال)",
-                                  0.0, 10000.0, 5.0, step=1.0)
-    max_symbols = st.number_input("حداکثر تعداد نماد برای بررسی (۰ = همه)", 0, 2000, 0, step=50,
+                                  0.0, 10000.0, float(cfg["min_avg_value"]) / 1e9, step=1.0)
+    max_symbols = st.number_input("حداکثر تعداد نماد برای بررسی (۰ = همه)", 0, 2000,
+                                  int(cfg["max_symbols"]), step=50,
                                   help="نمادها بر اساس ارزش معاملات امروز مرتب می‌شوند.")
+    # The alert watcher reads the same universe settings.
+    if (min_value_b * 1e9, int(max_symbols)) != (cfg["min_avg_value"], cfg["max_symbols"]):
+        cfg.update(min_avg_value=min_value_b * 1e9, max_symbols=int(max_symbols))
+        config.save(cfg)
     st.subheader("سرمایه و ریسک")
     capital_m = st.number_input("سرمایه (میلیون تومان)", 1.0, 1e7, 100.0, step=10.0)
     risk_pct = st.slider("ریسک هر معامله (٪ سرمایه)", 0.25, 5.0, 1.0, 0.25)
@@ -62,14 +72,9 @@ params = an.Params(min_avg_value=min_value_b * BILLION, risk_free=rf, fee_round_
 def load(source: str, max_symbols: int):
     if source.startswith("داده نمونه"):
         return (*demo.demo_market(), "نمونه")
-    market = data.fetch_market_watch()
-    universe = market[market["volume"] > 0].sort_values("value", ascending=False)
-    if max_symbols:
-        universe = universe.head(max_symbols)
     bar = st.progress(0.0, text="دریافت سابقه قیمت نمادها…")
-    histories = data.fetch_histories(
-        universe["ins_code"],
-        progress=lambda d, t: bar.progress(d / t, text=f"دریافت سابقه قیمت: {d} از {t}"))
+    market, histories = data.load_market_and_histories(
+        max_symbols, progress=lambda d, t: bar.progress(d / t, text=f"دریافت سابقه قیمت: {d} از {t}"))
     bar.empty()
     return market, histories, "TSETMC"
 
@@ -107,8 +112,28 @@ def badge(signal):
     return f"<span style='color:{SIGNAL_COLORS.get(signal, '#888')};font-weight:700'>{signal}</span>"
 
 
+@st.cache_resource
+def get_watcher():
+    return alerts.Watcher()
+
+
+watcher = get_watcher()
+if cfg["alerts_enabled"] and not watcher.running:
+    watcher.start()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def codal_letters(symbol):
+    return codal.latest_letters(symbol)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def codal_sales(symbol):
+    return codal.monthly_sales(symbol)
+
+
 tabs = st.tabs(["📊 نمای بازار", "⚡ نوسان‌گیری (کوتاه‌مدت)", "🏦 سرمایه‌گذاری (بلندمدت)",
-                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "ℹ️ راهنما"])
+                "🔍 تحلیل نماد", "🧮 مدیریت ریسک", "🔔 هشدار تلگرام", "ℹ️ راهنما"])
 
 # ---------------------------------------------------------------- overview
 with tabs[0]:
@@ -230,6 +255,30 @@ with tabs[2]:
                                                             "فاصله از سقف٪", "ارزش بازار (همت)")},
                          **{k: num(format="localized") for k in ("قیمت", "EPS", "ارزش نسبی")},
                      })
+        st.markdown("**رشد فروش از کدال** (گزارش‌های فعالیت ماهانه)")
+        g1, g2 = st.columns([1, 3])
+        n_codal = g1.number_input("تعداد نماد برتر", 5, 100, 20, step=5)
+        if g2.button("📥 دریافت فروش ماهانه از کدال برای نمادهای برتر جدول بالا"):
+            rows, bar = [], st.progress(0.0)
+            for i, r in enumerate(v.head(int(n_codal)).itertuples(), 1):
+                try:
+                    sales = codal_sales(r.symbol)
+                    g = codal.sales_growth(sales)
+                    rows.append({"نماد": r.symbol, "ماه‌های خوانده‌شده": len(sales),
+                                 "آخرین ماه": sales["period"].iloc[-1] if len(sales) else "—",
+                                 "رشد ماه به ماه٪": g["mom"], "رشد ۳ ماه اخیر٪": g["q_growth"]})
+                except codal.CodalError as e:
+                    st.error(str(e))
+                    break
+                bar.progress(i / int(n_codal), text=f"کدال: {r.symbol}")
+            bar.empty()
+            st.session_state["codal_growth"] = pd.DataFrame(rows)
+        if "codal_growth" in st.session_state and not st.session_state["codal_growth"].empty:
+            st.dataframe(st.session_state["codal_growth"], hide_index=True, width="stretch",
+                         column_config={k: st.column_config.NumberColumn(format="%.1f")
+                                        for k in ("رشد ماه به ماه٪", "رشد ۳ ماه اخیر٪")})
+            st.caption("رشد ۳ ماه اخیر = جمع فروش ۳ ماه آخر نسبت به ۳ ماه قبل از آن.")
+
         sc = v[(v["pe"] > 0) & (v["pe"] < 60)].dropna(subset=["ret_1y"])
         if not sc.empty:
             fig = px.scatter(sc, x="pe", y="ret_1y", color="lt_score", hover_name="symbol",
@@ -308,6 +357,39 @@ with tabs[3]:
         fig.update_xaxes(rangebreaks=[dict(bounds=["thu", "sat"])] if origin == "TSETMC" else [])
         st.plotly_chart(fig, width="stretch")
 
+        st.subheader("📄 کدال")
+        sym = mk.loc[code, "symbol"]
+        if origin == "نمونه":
+            st.caption("برای نمادهای نمونه اطلاعات کدال وجود ندارد.")
+        else:
+            c1, c2 = st.columns([3, 2])
+            try:
+                letters = codal_letters(sym)
+                c1.markdown("**آخرین اطلاعیه‌ها**")
+                c1.dataframe(letters.assign(important=letters["important"].map({True: "⭐", False: ""}))
+                             [["important", "date", "title", "url"]],
+                             hide_index=True, width="stretch", height=380, column_config={
+                                 "important": st.column_config.TextColumn("", width="small"),
+                                 "date": "تاریخ انتشار", "title": "عنوان",
+                                 "url": st.column_config.LinkColumn("لینک", display_text="مشاهده")})
+            except codal.CodalError as e:
+                c1.warning(str(e))
+            try:
+                sales = codal_sales(sym)
+                if sales.empty:
+                    c2.info("فروش ماهانه‌ای از گزارش‌های این نماد خوانده نشد (قالب گزارش برخی صنایع، "
+                            "مثل بانک‌ها و سرمایه‌گذاری‌ها، متفاوت است).")
+                else:
+                    g = codal.sales_growth(sales)
+                    figs = go.Figure(go.Bar(x=sales["period"], y=sales["sales"] / 1e3, marker_color="#3b82f6"))
+                    figs.update_layout(title="فروش ماهانه (میلیارد ریال)", height=300,
+                                       margin=dict(l=10, r=10, t=40, b=10))
+                    c2.plotly_chart(figs, width="stretch")
+                    c2.markdown(f"رشد ماه به ماه: **{fmt(g['mom'], 1)}٪** · "
+                                f"رشد ۳ ماه اخیر: **{fmt(g['q_growth'], 1)}٪**")
+            except codal.CodalError as e:
+                c2.warning(str(e))
+
 # -------------------------------------------------------------------- risk
 with tabs[4]:
     st.subheader("🧮 هدف سود روزانه و مدیریت ریسک")
@@ -350,9 +432,85 @@ with tabs[4]:
         else:
             st.error("حد ضرر باید کمتر از قیمت ورود باشد.")
 
-# -------------------------------------------------------------------- help
+# ---------------------------------------------------------------- telegram
 with tabs[5]:
-    st.markdown("""
+    st.subheader("🔔 هشدار تلگرام")
+    with st.expander("راهنمای راه‌اندازی (یک بار)", expanded=not cfg["telegram_token"]):
+        st.markdown("""
+1. در تلگرام به **@BotFather** پیام دهید، دستور `/newbot` را بفرستید و یک نام بدهید.
+2. توکنی که BotFather می‌دهد (شبیه `123456:ABC-...`) را در کادر زیر وارد کنید.
+3. ربات خودتان را در تلگرام باز کنید و دکمه **Start** را بزنید (یا هر پیامی بفرستید).
+4. دکمه «پیدا کردن شناسه چت» را بزنید و سپس «ارسال پیام آزمایشی».
+
+اگر تلگرام روی اینترنت شما فیلتر است، آدرس پروکسی (مثلاً `socks5h://127.0.0.1:1080` یا
+`http://127.0.0.1:10809`) فیلتر‌شکن خود را وارد کنید تا فقط پیام‌های تلگرام از آن عبور کنند.
+""")
+    a, b = st.columns(2)
+    with a:
+        token = st.text_input("توکن ربات", cfg["telegram_token"], type="password")
+        chat_id = st.text_input("شناسه چت (chat id)", cfg["telegram_chat_id"])
+        proxy = st.text_input("پروکسی (اختیاری)", cfg["telegram_proxy"])
+    with b:
+        min_alert = st.slider("حداقل امتیاز نوسان‌گیری برای هشدار", 50, 100, int(cfg["alert_min_score"]))
+        interval = st.number_input("فاصله بررسی (دقیقه)", 5, 240, int(cfg["alert_interval_min"]), step=5)
+        lt_daily = st.checkbox("ارسال روزانه برترین‌های بلندمدت", cfg["alert_long_term"])
+        codal_ev = st.checkbox("ارسال اطلاعیه‌های مهم کدال برای نمادهای هشدار داده‌شده", cfg["alert_codal_events"])
+        outside = st.checkbox("بررسی خارج از ساعت بازار هم انجام شود", cfg["alert_outside_hours"])
+    new_cfg = {**cfg, "telegram_token": token.strip(), "telegram_chat_id": chat_id.strip(),
+               "telegram_proxy": proxy.strip(), "alert_min_score": min_alert,
+               "alert_interval_min": int(interval), "alert_long_term": lt_daily,
+               "alert_codal_events": codal_ev, "alert_outside_hours": outside}
+
+    c = st.columns(4)
+    if c[0].button("💾 ذخیره تنظیمات", width="stretch"):
+        config.save(new_cfg)
+        st.success("ذخیره شد.")
+    if c[1].button("🔎 پیدا کردن شناسه چت", width="stretch"):
+        try:
+            chats = alerts.find_chat_ids(new_cfg)
+            if chats:
+                new_cfg["telegram_chat_id"] = chats[-1][0]
+                config.save(new_cfg)
+                st.success("پیدا شد و ذخیره شد: " + "، ".join(f"{n} ({i})" for i, n in chats))
+                st.rerun()
+            else:
+                st.warning("پیامی پیدا نشد. ابتدا در تلگرام به ربات خود پیام بدهید و دوباره امتحان کنید.")
+        except alerts.TelegramError as e:
+            st.error(str(e))
+    if c[2].button("✉️ ارسال پیام آزمایشی", width="stretch"):
+        try:
+            alerts.send(new_cfg, "✅ اتصال داشبورد بورس به تلگرام برقرار است.")
+            st.success("پیام ارسال شد.")
+        except alerts.TelegramError as e:
+            st.error(str(e))
+    if c[3].button("🚀 ارسال هشدارهای همین حالا", width="stretch"):
+        try:
+            n = alerts.run_once(new_cfg, market=market, histories=histories, log=lambda *_: None)
+            st.success(f"{n} پیام ارسال شد (نمادهایی که امروز قبلاً اعلام شده‌اند تکرار نمی‌شوند).")
+        except alerts.TelegramError as e:
+            st.error(str(e))
+
+    st.divider()
+    st.markdown("**هشدار خودکار**")
+    st.caption("تا وقتی برنامه باز است (حتی اگر مرورگر بسته باشد)، در ساعات بازار (شنبه تا چهارشنبه "
+               "۹:۰۰ تا ۱۲:۴۵) هر چند دقیقه بازار بررسی و نمادهای جدید ارسال می‌شوند. هر نماد روزی یک بار.")
+    on = st.toggle("فعال", cfg["alerts_enabled"])
+    if on != cfg["alerts_enabled"]:
+        new_cfg["alerts_enabled"] = on
+        config.save(new_cfg)
+        watcher.start() if on else watcher.stop()
+        st.rerun()
+    status = "🟢 در حال اجرا" if watcher.running else "⚪ متوقف"
+    last = watcher.last_run.strftime("%H:%M") if watcher.last_run else "—"
+    st.markdown(f"وضعیت: **{status}** · آخرین بررسی: {last} · پیام‌های آخرین بررسی: {watcher.last_sent}")
+    if watcher.last_error:
+        st.error(f"خطای آخرین بررسی: {watcher.last_error}")
+    if origin == "نمونه":
+        st.caption("هشدار خودکار همیشه از داده زنده TSETMC استفاده می‌کند، نه داده نمونه.")
+
+# -------------------------------------------------------------------- help
+with tabs[6]:
+    st.markdown(f"""
 ### امتیاز نوسان‌گیری (۰ تا ۱۰۰)
 | عامل | منطق |
 |---|---|
@@ -371,5 +529,8 @@ with tabs[5]:
 - EPS از TSETMC گرفته می‌شود (پیش‌بینی یا آخرین گزارش شرکت) و ممکن است قدیمی باشد؛ برای تحلیل دقیق
   بنیادی صورت‌های مالی را در [کدال](https://codal.ir) ببینید.
 - قیمت‌ها برای افزایش سرمایه و سود نقدی تعدیل می‌شوند؛ تعدیل تقریبی است.
-- نخستین دریافت همه نمادها چند دقیقه طول می‌کشد؛ سابقه‌ها ۶ ساعت در پوشه `.cache` نگه داشته می‌شوند.
+- نخستین دریافت همه نمادها چند دقیقه طول می‌کشد؛ سابقه‌ها ۶ ساعت ذخیره می‌شوند.
+- تنظیمات، کش و سابقه هشدارها در این پوشه نگه داشته می‌شوند: `{config.data_dir()}`
+- فروش ماهانه از «گزارش فعالیت ماهانه» کدال خوانده می‌شود؛ قالب گزارش بانک‌ها، بیمه‌ها و شرکت‌های
+  سرمایه‌گذاری متفاوت است و ممکن است خوانده نشود.
 """)
